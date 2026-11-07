@@ -1,0 +1,8 @@
+/target/
+*.exe
+*.pdb
+*.aof
+*.snap
+*.snap.enc
+*.tmp
+/lsm_data/

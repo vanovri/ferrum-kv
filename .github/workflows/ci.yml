@@ -1,0 +1,48 @@
+name: FerrumKV CI & Jepsen Verifier
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Pure-Rust Zero-Crate Test & Jepsen Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Audit zero external crates & zero unsafe/unwrap/expect
+        shell: bash
+        run: |
+          python3 - << 'PY'
+          import pathlib, re, sys, tomllib
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          assert not cargo.get("dependencies"), f"Expected 0 dependencies, found: {cargo.get('dependencies')}"
+          for p in pathlib.Path("src").rglob("*.rs"):
+              txt = p.read_text(encoding="utf-8")
+              if re.search(r"\.unwrap\(|\.expect\(|todo!\(|unimplemented!\(", txt):
+                  print(f"Policy violation in {p}", file=sys.stderr)
+                  sys.exit(1)
+              for line in txt.splitlines():
+                  if re.search(r"\bunsafe\b", line) and "#![forbid(unsafe_code)]" not in line:
+                      print(f"Unsafe violation in {p}: {line}", file=sys.stderr)
+                      sys.exit(1)
+          print("Static policy audit PASSED: 0 dependencies, 0 unsafe, 0 unwrap/expect/todo.")
+          PY
+
+      - name: Compile & run 22 unit + TCP integration tests (-D warnings)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo test --release -- --test-threads=1
+
+      - name: Run 3-Node Raft Jepsen Linearizability & Crash-Recovery Nemesis Suite
+        run: cargo run --release -- jepsen
+
+      - name: Run Pipelined RESP3 Benchmark Smoke Suite
+        run: cargo run --release -- bench --clients 16 --requests 20000 --pipeline 16
