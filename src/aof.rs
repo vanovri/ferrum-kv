@@ -543,6 +543,47 @@ fn encode_exported_entry_aof(entry: &ExportedEntry, out: &mut Vec<u8>) -> Engine
     Ok(())
 }
 
+fn has_subsequent_resp_command_marker(rem: &[u8]) -> bool {
+    if rem.len() < 5 {
+        return false;
+    }
+    let tail = &rem[1..];
+    tail.windows(4)
+        .any(|w| w == b"\r\n*1" || w == b"\r\n*2" || w == b"\r\n*3" || w == b"\r\n*4")
+}
+
+/// Replays in-memory AOF bytes into `StorageEngine` (`[WAL-01]` compliant: skips trailing NUL padding at EOF
+/// and rejects mid-file `ParseStatus::Incomplete` frames followed by `\r\n*2` or `\r\n*3` command markers).
+pub fn recover_into(raw: &[u8], storage: &StorageEngine) -> EngineResult<usize> {
+    let mut offset = 0usize;
+    let mut applied = 0usize;
+
+    while offset < raw.len() {
+        if raw[offset..].iter().all(|&b| b == 0) {
+            break;
+        }
+        match RespParser::parse(&raw[offset..])? {
+            ParseStatus::Complete { frame, consumed } => {
+                apply_replayed_frame(&frame, storage)?;
+                offset += consumed;
+                applied += 1;
+            }
+            ParseStatus::Incomplete => {
+                if has_subsequent_resp_command_marker(&raw[offset..]) {
+                    return Err(EngineError::CorruptedPersistence(
+                        "mid-file incomplete AOF frame before subsequent command marker".to_string(),
+                    ));
+                }
+                return Err(EngineError::CorruptedPersistence(
+                    "truncated trailing frame in AOF log".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(applied)
+}
+
 /// Replays an existing AOF file into `StorageEngine` on server boot.
 pub fn replay_aof(path: impl AsRef<Path>, storage: &StorageEngine) -> EngineResult<usize> {
     let path_ref = path.as_ref();
@@ -563,9 +604,25 @@ pub fn replay_aof(path: impl AsRef<Path>, storage: &StorageEngine) -> EngineResu
         }
 
         loop {
-            let status = RespParser::parse(stream_buf.readable_slice())?;
+            let rem = stream_buf.readable_slice();
+            if rem.is_empty() {
+                break;
+            }
+            if n == 0 && rem.iter().all(|&b| b == 0) {
+                stream_buf.consume(rem.len());
+                break;
+            }
+            let status = RespParser::parse(rem)?;
             let (frame, consumed) = match status {
-                ParseStatus::Incomplete => break,
+                ParseStatus::Incomplete => {
+                    if n == 0 && has_subsequent_resp_command_marker(rem) {
+                        return Err(EngineError::CorruptedPersistence(
+                            "mid-file incomplete AOF frame before subsequent command marker"
+                                .to_string(),
+                        ));
+                    }
+                    break;
+                }
                 ParseStatus::Complete { frame, consumed } => (frame, consumed),
             };
             apply_replayed_frame(&frame, storage)?;
@@ -660,6 +717,10 @@ pub fn recover_from_crash(
     let mut crc32_verified = 0usize;
 
     while offset < raw.len() {
+        if raw[offset..].iter().all(|&b| b == 0) {
+            offset = raw.len();
+            break;
+        }
         match RespParser::parse(&raw[offset..]) {
             Ok(ParseStatus::Complete { frame, consumed }) => {
                 let frame_slice = &raw[offset..offset + consumed];
@@ -703,7 +764,17 @@ pub fn recover_from_crash(
                     crc32_verified += 1;
                 }
             }
-            Ok(ParseStatus::Incomplete) | Err(_) => {
+            Ok(ParseStatus::Incomplete) => {
+                if has_subsequent_resp_command_marker(&raw[offset..]) {
+                    return Err(EngineError::CorruptedPersistence(
+                        "mid-file incomplete AOF frame before subsequent command marker"
+                            .to_string(),
+                    ));
+                }
+                used_fallback = snapshot_keys > 0;
+                break;
+            }
+            Err(_) => {
                 used_fallback = snapshot_keys > 0;
                 break;
             }
@@ -1161,6 +1232,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
     }
 
     let mut pos = 5usize;
+    const MAX_SNAPSHOT_FRAME_BYTES: usize = 64 * 1024 * 1024;
     let read_u32 = |buf: &[u8], cur: &mut usize| -> EngineResult<u32> {
         if *cur + 4 > buf.len() {
             return Err(EngineError::CorruptedPersistence("unexpected EOF".to_string()));
@@ -1187,23 +1259,49 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
         Ok(v)
     };
     fn read_slice<'a>(buf: &'a [u8], cur: &mut usize, len: usize) -> EngineResult<&'a [u8]> {
-        if *cur + len > buf.len() {
+        if len > MAX_SNAPSHOT_FRAME_BYTES || len > buf.len().saturating_sub(*cur) {
             return Err(EngineError::CorruptedPersistence("unexpected EOF".to_string()));
         }
         let s = &buf[*cur..*cur + len];
         *cur += len;
         Ok(s)
     }
+    fn read_bytes(buf: &[u8], cur: &mut usize) -> EngineResult<Vec<u8>> {
+        if *cur + 4 > buf.len() {
+            return Err(EngineError::CorruptedPersistence("unexpected EOF".to_string()));
+        }
+        let len = u32::from_le_bytes([buf[*cur], buf[*cur + 1], buf[*cur + 2], buf[*cur + 3]]) as usize;
+        *cur += 4;
+        let rem = buf.len().saturating_sub(*cur);
+        if len > MAX_SNAPSHOT_FRAME_BYTES || len > rem {
+            return Err(EngineError::CorruptedPersistence(
+                "snapshot length prefix exceeds remaining buffer".to_string(),
+            ));
+        }
+        let mut out = vec![0u8; len];
+        out.copy_from_slice(&buf[*cur..*cur + len]);
+        *cur += len;
+        Ok(out)
+    }
+    fn check_item_count(count: usize, min_bytes_per_item: usize, rem: usize) -> EngineResult<()> {
+        if count.saturating_mul(min_bytes_per_item.max(1)) > rem {
+            return Err(EngineError::CorruptedPersistence(
+                "snapshot collection count exceeds remaining buffer".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     let data = &raw[..payload_end];
     let total = read_u64(data, &mut pos)? as usize;
+    check_item_count(total, 13, data.len().saturating_sub(pos))?;
     let mut loaded = 0usize;
 
     for _ in 0..total {
         let exp_ms = read_u64(data, &mut pos)?;
         let exp_opt = if exp_ms > 0 { Some(exp_ms) } else { None };
-        let key_len = read_u32(data, &mut pos)? as usize;
-        let key = read_slice(data, &mut pos, key_len)?;
+        let key_vec = read_bytes(data, &mut pos)?;
+        let key = key_vec.as_slice();
         let tag = read_slice(data, &mut pos, 1)?[0];
 
         match tag {
@@ -1217,6 +1315,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             }
             2 => {
                 let count = read_u32(data, &mut pos)? as usize;
+                check_item_count(count, 4, data.len().saturating_sub(pos))?;
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
                     let ilen = read_u32(data, &mut pos)? as usize;
@@ -1231,6 +1330,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             }
             3 => {
                 let count = read_u32(data, &mut pos)? as usize;
+                check_item_count(count, 8, data.len().saturating_sub(pos))?;
                 let mut pairs = Vec::with_capacity(count);
                 for _ in 0..count {
                     let flen = read_u32(data, &mut pos)? as usize;
@@ -1248,6 +1348,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             }
             4 => {
                 let count = read_u32(data, &mut pos)? as usize;
+                check_item_count(count, 12, data.len().saturating_sub(pos))?;
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
                     let bits = read_u64(data, &mut pos)?;
@@ -1266,10 +1367,12 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             5 => {
                 let mut slog = StreamLog::new();
                 let e_cnt = read_u32(data, &mut pos)? as usize;
+                check_item_count(e_cnt, 20, data.len().saturating_sub(pos))?;
                 for _ in 0..e_cnt {
                     let ms = read_u64(data, &mut pos)?;
                     let seq = read_u64(data, &mut pos)?;
                     let f_cnt = read_u32(data, &mut pos)? as usize;
+                    check_item_count(f_cnt, 8, data.len().saturating_sub(pos))?;
                     let mut pairs = Vec::with_capacity(f_cnt);
                     for _ in 0..f_cnt {
                         let fl = read_u32(data, &mut pos)? as usize;
@@ -1282,12 +1385,14 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
                     slog.xadd(&id_b, &pairs)?;
                 }
                 let g_cnt = read_u32(data, &mut pos)? as usize;
+                check_item_count(g_cnt, 24, data.len().saturating_sub(pos))?;
                 for _ in 0..g_cnt {
                     let nl = read_u32(data, &mut pos)? as usize;
                     let gname = read_slice(data, &mut pos, nl)?;
                     let l_ms = read_u64(data, &mut pos)?;
                     let l_seq = read_u64(data, &mut pos)?;
                     let p_cnt = read_u32(data, &mut pos)? as usize;
+                    check_item_count(p_cnt, 36, data.len().saturating_sub(pos))?;
                     let mut pel = Vec::with_capacity(p_cnt);
                     for _ in 0..p_cnt {
                         let p_ms = read_u64(data, &mut pos)?;
@@ -1327,6 +1432,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             7 => {
                 let probes = read_u32(data, &mut pos)?;
                 let w_cnt = read_u32(data, &mut pos)? as usize;
+                check_item_count(w_cnt, 8, data.len().saturating_sub(pos))?;
                 let mut words = Vec::with_capacity(w_cnt);
                 for _ in 0..w_cnt {
                     words.push(read_u64(data, &mut pos)?);
@@ -1353,6 +1459,12 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
                 let uses_sq8 = hdr[1] != 0;
                 let dim = read_u32(data, &mut pos)? as usize;
                 let v_cnt = read_u32(data, &mut pos)? as usize;
+                if dim > 65_536 {
+                    return Err(EngineError::CorruptedPersistence(
+                        "snapshot vector dimension exceeds bound".to_string(),
+                    ));
+                }
+                check_item_count(v_cnt, 4usize.saturating_add(dim.saturating_mul(4)), data.len().saturating_sub(pos))?;
                 let mut hnsw = HnswIndex::new(metric, uses_sq8);
                 let mut vec_buf = vec![0.0f32; dim];
                 for _ in 0..v_cnt {
@@ -1367,6 +1479,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             }
             10 => {
                 let d_cnt = read_u32(data, &mut pos)? as usize;
+                check_item_count(d_cnt, 8, data.len().saturating_sub(pos))?;
                 let mut fts = FullTextIndex::new();
                 for _ in 0..d_cnt {
                     let id_len = read_u32(data, &mut pos)? as usize;
@@ -1379,6 +1492,7 @@ pub fn deserialize_snapshot_bytes(raw: &[u8], storage: &StorageEngine) -> Engine
             }
             11 => {
                 let s_cnt = read_u32(data, &mut pos)? as usize;
+                check_item_count(s_cnt, 16, data.len().saturating_sub(pos))?;
                 let mut ts = GorillaTimeSeries::new();
                 for _ in 0..s_cnt {
                     let t = read_u64(data, &mut pos)? as i64;
@@ -1489,4 +1603,52 @@ fn write_atomic_file(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     drop(writer);
 
     fs::rename(&tmp_path, dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wal01_trailing_nul_padding_and_mid_file_incomplete_frame() -> EngineResult<()> {
+        let storage = StorageEngine::new(4)?;
+        let mut raw = Vec::new();
+        encode_command_slices(&mut raw, &[b"SET", b"k1", b"v1"]);
+        raw.extend_from_slice(&[0u8; 64]); // Trailing NUL padding at EOF
+        let applied = recover_into(&raw, &storage)?;
+        assert_eq!(applied, 1);
+        assert_eq!(storage.get_bytes(b"k1")?.as_deref(), Some(&b"v1"[..]));
+
+        // Mid-file incomplete frame (claims $9999 bytes) followed by another command `\r\n*3\r\n...`
+        let mut mid_corrupt = Vec::new();
+        encode_command_slices(&mut mid_corrupt, &[b"SET", b"k1", b"v1"]);
+        mid_corrupt.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$9999\r\nshort\r\n*3\r\n$3\r\nSET\r\n$2\r\nk3\r\n$2\r\nv3\r\n");
+
+        let storage2 = StorageEngine::new(4)?;
+        let res = recover_into(&mid_corrupt, &storage2);
+        assert!(
+            matches!(res, Err(EngineError::CorruptedPersistence(_))),
+            "expected CorruptedPersistence on mid-file incomplete AOF frame, got {res:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal02_snapshot_oversized_length_prefix_rejects_oom() -> EngineResult<()> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(SNAPSHOT_MAGIC);
+        payload.extend_from_slice(&1u64.to_le_bytes()); // 1 entry
+        payload.extend_from_slice(&0u64.to_le_bytes()); // expire_ms = 0
+        payload.extend_from_slice(&(0xFFFF_FFFFu32).to_le_bytes()); // corrupted 4 GiB key_len!
+        let crc = !crc32_update(0xFFFF_FFFF, &payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+
+        let storage = StorageEngine::new(4)?;
+        let res = deserialize_snapshot_bytes(&payload, &storage);
+        assert!(
+            matches!(res, Err(EngineError::CorruptedPersistence(_))),
+            "expected CorruptedPersistence on 4 GiB key_len prefix, got {res:?}"
+        );
+        Ok(())
+    }
 }

@@ -519,14 +519,19 @@ fn load_sstable_metadata(seq_id: u64, path: &Path) -> EngineResult<SsTableMeta> 
     }
 
     // Read & verify Fence-Pointer Index Block
+    let data_region_end = file_len - (SST_FOOTER_BYTES as u64);
+    const MAX_SST_BLOCK_ALLOC: u64 = 64 * 1024 * 1024;
+    if index_len < 16
+        || index_len > MAX_SST_BLOCK_ALLOC
+        || index_offset.checked_add(index_len).map_or(true, |end| end > data_region_end)
+    {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable index block length out of bounds".to_string(),
+        ));
+    }
     file.seek(SeekFrom::Start(index_offset))?;
     let mut idx_buf = vec![0u8; index_len as usize];
     file.read_exact(&mut idx_buf)?;
-    if idx_buf.len() < 16 {
-        return Err(EngineError::CorruptedPersistence(
-            "truncated SSTable index block".to_string(),
-        ));
-    }
     let idx_payload_end = idx_buf.len() - 4;
     let mut cpos = idx_payload_end;
     let idx_crc = read_u32_le(&idx_buf, &mut cpos)?;
@@ -539,10 +544,15 @@ fn load_sstable_metadata(seq_id: u64, path: &Path) -> EngineResult<SsTableMeta> 
     let mut ipos = 0usize;
     let entry_count = read_u64_le(&idx_buf[..idx_payload_end], &mut ipos)? as usize;
     let fence_count = read_u32_le(&idx_buf[..idx_payload_end], &mut ipos)? as usize;
+    if fence_count.saturating_mul(16) > idx_payload_end.saturating_sub(ipos) {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable fence count exceeds index block payload".to_string(),
+        ));
+    }
     let mut fence_index = Vec::with_capacity(fence_count);
     for _ in 0..fence_count {
         let klen = read_u32_le(&idx_buf[..idx_payload_end], &mut ipos)? as usize;
-        if ipos + klen > idx_payload_end {
+        if klen > idx_payload_end.saturating_sub(ipos) {
             return Err(EngineError::CorruptedPersistence(
                 "truncated fence key".to_string(),
             ));
@@ -559,14 +569,17 @@ fn load_sstable_metadata(seq_id: u64, path: &Path) -> EngineResult<SsTableMeta> 
     }
 
     // Read & verify Embedded Bloom Filter Block
+    if bloom_len < 12
+        || bloom_len > MAX_SST_BLOCK_ALLOC
+        || bloom_offset.checked_add(bloom_len).map_or(true, |end| end > data_region_end)
+    {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable bloom block length out of bounds".to_string(),
+        ));
+    }
     file.seek(SeekFrom::Start(bloom_offset))?;
     let mut bbuf = vec![0u8; bloom_len as usize];
     file.read_exact(&mut bbuf)?;
-    if bbuf.len() < 12 {
-        return Err(EngineError::CorruptedPersistence(
-            "truncated SSTable bloom block".to_string(),
-        ));
-    }
     let b_end = bbuf.len() - 4;
     let mut bc_pos = b_end;
     let b_crc = read_u32_le(&bbuf, &mut bc_pos)?;
@@ -578,6 +591,11 @@ fn load_sstable_metadata(seq_id: u64, path: &Path) -> EngineResult<SsTableMeta> 
     let mut bpos = 0usize;
     let num_probes = read_u32_le(&bbuf[..b_end], &mut bpos)?;
     let num_words = read_u32_le(&bbuf[..b_end], &mut bpos)? as usize;
+    if num_words.saturating_mul(8) > b_end.saturating_sub(bpos) {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable bloom word count exceeds block payload".to_string(),
+        ));
+    }
     let mut words = Vec::with_capacity(num_words);
     for _ in 0..num_words {
         words.push(read_u64_le(&bbuf[..b_end], &mut bpos)?);
@@ -597,7 +615,13 @@ fn decode_verified_data_block(
     block_offset: u64,
     block_len: u32,
 ) -> EngineResult<Vec<(Box<[u8]>, LsmEntry)>> {
-    if block_len < 8 {
+    let file_len = file.metadata()?.len();
+    if block_len < 8
+        || (block_len as u64) > 64 * 1024 * 1024
+        || block_offset
+            .checked_add(block_len as u64)
+            .map_or(true, |end| end > file_len)
+    {
         return Err(EngineError::CorruptedPersistence(
             "corrupted SSTable data block length".to_string(),
         ));
@@ -618,11 +642,16 @@ fn decode_verified_data_block(
     let body = &raw[..body_end];
     let mut pos = 0usize;
     let count = read_u32_le(body, &mut pos)? as usize;
+    if count.saturating_mul(5) > body.len().saturating_sub(pos) {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable data block record count exceeds block payload".to_string(),
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
 
     for _ in 0..count {
         let klen = read_u32_le(body, &mut pos)? as usize;
-        if pos + klen + 1 > body.len() {
+        if klen.saturating_add(1) > body.len().saturating_sub(pos) {
             return Err(EngineError::CorruptedPersistence(
                 "SSTable data block record truncated".to_string(),
             ));
@@ -634,7 +663,7 @@ fn decode_verified_data_block(
         let entry = match tag {
             1 => {
                 let vlen = read_u32_le(body, &mut pos)? as usize;
-                if pos + vlen > body.len() {
+                if vlen > body.len().saturating_sub(pos) {
                     return Err(EngineError::CorruptedPersistence(
                         "SSTable value truncated".to_string(),
                     ));
@@ -664,7 +693,13 @@ fn find_key_in_verified_block(
     block_len: u32,
     target_key: &[u8],
 ) -> EngineResult<Option<LsmEntry>> {
-    if block_len < 8 {
+    let file_len = file.metadata()?.len();
+    if block_len < 8
+        || (block_len as u64) > 64 * 1024 * 1024
+        || block_offset
+            .checked_add(block_len as u64)
+            .map_or(true, |end| end > file_len)
+    {
         return Err(EngineError::CorruptedPersistence(
             "corrupted SSTable data block length".to_string(),
         ));
@@ -685,10 +720,15 @@ fn find_key_in_verified_block(
     let body = &raw[..body_end];
     let mut pos = 0usize;
     let count = read_u32_le(body, &mut pos)? as usize;
+    if count.saturating_mul(5) > body.len().saturating_sub(pos) {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable data block record count exceeds block payload".to_string(),
+        ));
+    }
 
     for _ in 0..count {
         let klen = read_u32_le(body, &mut pos)? as usize;
-        if pos + klen + 1 > body.len() {
+        if klen.saturating_add(1) > body.len().saturating_sub(pos) {
             return Err(EngineError::CorruptedPersistence(
                 "SSTable data block record truncated".to_string(),
             ));
@@ -701,7 +741,7 @@ fn find_key_in_verified_block(
         match tag {
             1 => {
                 let vlen = read_u32_le(body, &mut pos)? as usize;
-                if pos + vlen > body.len() {
+                if vlen > body.len().saturating_sub(pos) {
                     return Err(EngineError::CorruptedPersistence(
                         "SSTable value truncated".to_string(),
                     ));
@@ -818,6 +858,37 @@ mod tests {
 
         let scanned = reopened.scan(b"row:00000", b"row:00009", 100)?;
         assert_eq!(scanned.len(), 8); // 00000 & 00005 were deleted
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal02_sstable_corrupted_oversized_length_rejects_oom() -> EngineResult<()> {
+        let dir = env::temp_dir().join(format!("ferrum_lsm_wal02_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        let sst_path = dir.join("sst_00000001.sst");
+        let items = vec![(
+            b"k1".to_vec().into_boxed_slice(),
+            LsmEntry::Value(b"v1".to_vec().into_boxed_slice()),
+        )];
+        write_sstable_file(1, &sst_path, &items)?;
+
+        // Corrupt footer `index_len` to 0xFFFF_FFFF (4 GiB) with valid footer CRC32 -> must reject before allocation!
+        let mut raw = fs::read(&sst_path)?;
+        let footer_start = raw.len() - SST_FOOTER_BYTES;
+        raw[footer_start + 8..footer_start + 16].copy_from_slice(&(0xFFFF_FFFFu64).to_le_bytes());
+        let new_fcrc = crc32_ieee(&raw[footer_start..footer_start + 32]);
+        raw[footer_start + 32..footer_start + 36].copy_from_slice(&new_fcrc.to_le_bytes());
+        fs::write(&sst_path, &raw)?;
+
+        let res = LsmEngine::open(&dir, 4096);
+        assert!(
+            matches!(res, Err(EngineError::CorruptedPersistence(_))),
+            "expected CorruptedPersistence for oversized SSTable index_len"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

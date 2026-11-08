@@ -314,7 +314,12 @@ impl GorillaTimeSeries {
                 } else {
                     let l = reader.read_bits(5)? as u8;
                     let mlen = (reader.read_bits(6)? as u8) + 1;
-                    let tr = 64u8 - l - mlen;
+                    if l.saturating_add(mlen) > 64 {
+                        return Err(EngineError::CorruptedPersistence(
+                            "Gorilla XOR window leading + meaningful bits exceeds 64".to_string(),
+                        ));
+                    }
+                    let tr = 64u8 - (l + mlen);
                     prev_leading = l;
                     prev_trailing = tr;
                     (l, mlen, tr)
@@ -422,5 +427,38 @@ mod tests {
         )?;
         assert_eq!(bucketed.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn test_um02_corrupted_gorilla_xor_window_rejects_underflow() {
+        let mut writer = BitWriter::new();
+        // Sample 0: ts = 1000, val = 1.0
+        writer.write_signed(1000, 64);
+        writer.write_bits(1.0f64.to_bits(), 64);
+        // Sample 1: delta = 10 (32-bit), xor_nonzero = 1, new_window = 1, leading = 31 (5 bits), mlen-1 = 63 (6 bits -> mlen = 64)
+        // l + mlen = 31 + 64 = 95 > 64 -> must return Err(CorruptedPersistence) instead of panicking on 64u8 - l - mlen!
+        writer.write_signed(10, 32);
+        writer.write_bit(true);
+        writer.write_bit(true);
+        writer.write_bits(31, 5);
+        writer.write_bits(63, 6);
+        writer.write_bits(0, 64);
+
+        let corrupted_ts = GorillaTimeSeries {
+            stream: writer,
+            count: 2,
+            first_ts: 1000,
+            prev_ts: 1010,
+            prev_delta: 10,
+            prev_val_bits: 1.0f64.to_bits(),
+            prev_leading: 0,
+            prev_trailing: 0,
+            has_prev_window: false,
+        };
+        let res = corrupted_ts.decode_all();
+        assert!(
+            matches!(res, Err(EngineError::CorruptedPersistence(_))),
+            "expected CorruptedPersistence on l + mlen > 64, got {res:?}"
+        );
     }
 }
