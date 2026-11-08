@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
 use crate::error::{EngineError, EngineResult};
 use crate::pubsub::glob_match;
 use crate::storage::hashtable::RawHashTable;
+use crate::telemetry::CachePadded;
 use crate::vm::sha256;
 
 // ==================== RFC 2104 HMAC-SHA256 ====================
@@ -399,7 +401,8 @@ impl AclUser {
 }
 
 pub struct AclManager {
-    users: RwLock<RawHashTable<AclUser>>,
+    default_is_open: CachePadded<AtomicBool>,
+    users: CachePadded<RwLock<RawHashTable<AclUser>>>,
 }
 
 impl Default for AclManager {
@@ -416,11 +419,15 @@ impl AclManager {
             AclUser::default_open_user(),
         );
         Self {
-            users: RwLock::new(table),
+            default_is_open: CachePadded::new(AtomicBool::new(true)),
+            users: CachePadded::new(RwLock::new(table)),
         }
     }
 
     pub fn requires_initial_auth(&self) -> EngineResult<bool> {
+        if self.default_is_open.load(AtomicOrdering::Acquire) {
+            return Ok(false);
+        }
         let guard = self
             .users
             .read()
@@ -519,6 +526,15 @@ impl AclManager {
             }
         }
 
+        if username == b"default" {
+            let is_open = user.enabled
+                && user.nopass
+                && user.permissions == PERM_ALL
+                && user.key_patterns.len() == 1
+                && user.key_patterns[0].as_ref() == b"*";
+            self.default_is_open
+                .store(is_open, AtomicOrdering::Release);
+        }
         guard.insert(username.to_vec().into_boxed_slice(), user);
         Ok(())
     }
@@ -529,6 +545,11 @@ impl AclManager {
         cmd: &[u8],
         first_key: Option<&[u8]>,
     ) -> EngineResult<()> {
+        if let Some(uname) = username {
+            if self.default_is_open.load(AtomicOrdering::Relaxed) && uname == "default" {
+                return Ok(());
+            }
+        }
         if cmd.eq_ignore_ascii_case(b"AUTH")
             || cmd.eq_ignore_ascii_case(b"HELLO")
             || cmd.eq_ignore_ascii_case(b"QUIT")

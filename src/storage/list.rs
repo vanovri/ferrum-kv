@@ -160,8 +160,8 @@ mod tests {
         for i in 0..50 {
             list.push_back(format!("v{i}").into_bytes().into_boxed_slice());
         }
-        for _ in 0..20 {
-            assert!(list.pop_front().is_some());
+        for i in 0..20 {
+            assert_eq!(list.pop_front().as_deref(), Some(format!("v{i}").as_bytes()));
         }
         list.push_front(b"front".to_vec().into_boxed_slice());
         assert_eq!(list.len(), 31);

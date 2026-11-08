@@ -601,13 +601,13 @@ fn verify_aof_torn_write_and_snapshot_recovery() -> EngineResult<usize> {
         ));
     }
 
-    // 2. Append 12 post-snapshot AOF frames, then inject a mid-frame torn write at tail
+    // 2. Append 12 post-snapshot AOF frames with IEEE 802.3 CRC32 seals, then inject a mid-frame torn write at tail
     {
         let aof = AofEngine::open(&aof_path, FsyncPolicy::Always)?;
         for i in 0..12 {
             let k = format!("aof:delta:{i}");
             let v = format!("committed_{i}");
-            aof.log_command(&[b"SET", k.as_bytes(), v.as_bytes()])?;
+            aof.log_command_with_crc32(&[b"SET", k.as_bytes(), v.as_bytes()])?;
         }
         aof.flush_and_sync()?;
         aof.shutdown();
@@ -629,11 +629,12 @@ fn verify_aof_torn_write_and_snapshot_recovery() -> EngineResult<usize> {
         ));
     }
 
-    // `recover_from_crash` loads CRC32 snapshot + replays all 12 valid AOF frames + truncates exact torn tail!
+    // `recover_from_crash` loads CRC32 snapshot + verifies & replays all 12 CRC32-sealed AOF frames + truncates exact torn tail!
     let recovered = StorageEngine::new(8)?;
     let report = recover_from_crash(&aof_path, &snap_path, &recovered)?;
     if report.snapshot_keys_loaded != 10
         || report.aof_frames_replayed != 12
+        || report.crc32_verified_frames != 12
         || report.truncated_torn_bytes != torn_tail.len()
         || !report.used_snapshot_fallback
     {

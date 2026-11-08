@@ -33,6 +33,7 @@ use crate::storage::skiplist::SortedSet;
 use crate::storage::stream::{StreamEntry, StreamId, StreamLog};
 use crate::storage::timeseries::{GorillaTimeSeries, TsAggregation};
 use crate::storage::vector_hnsw::{HnswIndex, VectorMetric};
+use crate::telemetry::CachePadded;
 
 pub const DEFAULT_SHARD_COUNT: usize = 64;
 
@@ -73,6 +74,7 @@ impl DataValue {
 pub struct Record {
     pub value: DataValue,
     pub expires_at: Option<Instant>,
+    pub version: u64,
 }
 
 impl Record {
@@ -88,6 +90,7 @@ impl Record {
 #[derive(Debug)]
 pub struct Shard {
     table: RawHashTable<Record>,
+    /// Tracks tombstone versions ONLY for keys currently under `WATCH` when deleted (`DEL`/expire).
     key_versions: RawHashTable<u64>,
     next_version: u64,
     flush_epoch: u64,
@@ -101,8 +104,8 @@ impl Shard {
             0x517c_c1b7_2722_0a95u64.wrapping_add((shard_idx as u64).wrapping_mul(0x9e37_79b9));
         let seed1 = 0x85eb_ca6b_c2b2_ae35u64 ^ (shard_idx as u64).rotate_left(19);
         Self {
-            table: RawHashTable::with_capacity_and_seeds(64, seed0, seed1),
-            key_versions: RawHashTable::with_capacity_and_seeds(64, seed0 ^ 0xA5A5, seed1 ^ 0x5A5A),
+            table: RawHashTable::with_capacity_and_seeds(512, seed0, seed1),
+            key_versions: RawHashTable::with_capacity_and_seeds(16, seed0 ^ 0xA5A5, seed1 ^ 0x5A5A),
             next_version: 1,
             flush_epoch: 0,
             expiring_keys: 0,
@@ -112,7 +115,11 @@ impl Shard {
 
     #[inline]
     pub fn key_version(&self, key: &[u8]) -> u64 {
-        self.key_versions.get(key).copied().unwrap_or(0)
+        if let Some(rec) = self.table.get(key) {
+            rec.version
+        } else {
+            self.key_versions.get(key).copied().unwrap_or(0)
+        }
     }
 
     #[inline]
@@ -121,11 +128,32 @@ impl Shard {
     }
 
     #[inline]
-    fn bump_version(&mut self, key: &[u8]) {
+    fn alloc_version(&mut self) -> u64 {
         let v = self.next_version;
         self.next_version = self.next_version.wrapping_add(1);
-        self.key_versions
-            .insert(key.to_vec().into_boxed_slice(), v);
+        v
+    }
+
+    #[inline]
+    fn register_watch(&mut self, key: &[u8]) -> u64 {
+        let ver = self.key_version(key);
+        if let Some(slot) = self.key_versions.get_mut(key) {
+            *slot = ver;
+        } else {
+            self.key_versions
+                .insert(key.to_vec().into_boxed_slice(), ver);
+        }
+        ver
+    }
+
+    #[inline]
+    fn bump_version(&mut self, key: &[u8]) {
+        let v = self.alloc_version();
+        if let Some(rec) = self.table.get_mut(key) {
+            rec.version = v;
+        } else if let Some(slot) = self.key_versions.get_mut(key) {
+            *slot = v;
+        }
     }
 
     #[inline]
@@ -135,15 +163,18 @@ impl Shard {
             if rec.expires_at.is_some() {
                 self.expiring_keys = self.expiring_keys.saturating_sub(1);
             }
-            self.bump_version(key);
+            let v = self.alloc_version();
+            if let Some(slot) = self.key_versions.get_mut(key) {
+                *slot = v;
+            }
         }
         removed
     }
 
     #[inline]
-    fn upsert_record(&mut self, key: Box<[u8]>, rec: Record) {
+    fn upsert_record(&mut self, key: Box<[u8]>, mut rec: Record) {
         let new_has_ttl = rec.expires_at.is_some();
-        self.bump_version(&key);
+        rec.version = self.alloc_version();
         if let Some(prev) = self.table.insert(key, rec) {
             if prev.expires_at.is_some() && !new_has_ttl {
                 self.expiring_keys = self.expiring_keys.saturating_sub(1);
@@ -178,15 +209,17 @@ pub struct WatchedKeyStamp {
     pub version: u64,
 }
 
+const TX_FENCE_STRIPES: usize = 16;
+
 pub struct StorageEngine {
-    shards: Vec<RwLock<Shard>>,
+    shards: Vec<CachePadded<RwLock<Shard>>>,
     shard_mask: usize,
-    tx_exec_fence: RwLock<()>,
+    tx_exec_fence: Vec<CachePadded<RwLock<()>>>,
     lsm: Mutex<Option<Arc<LsmEngine>>>,
     boot_instant: Instant,
     boot_unix_ms: u64,
-    lazy_expired_count: AtomicU64,
-    active_expired_count: AtomicU64,
+    lazy_expired_count: CachePadded<AtomicU64>,
+    active_expired_count: CachePadded<AtomicU64>,
 }
 
 impl StorageEngine {
@@ -194,18 +227,22 @@ impl StorageEngine {
         let shard_count = requested_shards.max(2).next_power_of_two();
         let mut shards = Vec::with_capacity(shard_count);
         for idx in 0..shard_count {
-            shards.push(RwLock::new(Shard::new(idx)));
+            shards.push(CachePadded::new(RwLock::new(Shard::new(idx))));
+        }
+        let mut tx_exec_fence = Vec::with_capacity(TX_FENCE_STRIPES);
+        for _ in 0..TX_FENCE_STRIPES {
+            tx_exec_fence.push(CachePadded::new(RwLock::new(())));
         }
         let boot_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         Ok(Arc::new(Self {
             shards,
             shard_mask: shard_count - 1,
-            tx_exec_fence: RwLock::new(()),
+            tx_exec_fence,
             lsm: Mutex::new(None),
             boot_instant: Instant::now(),
             boot_unix_ms,
-            lazy_expired_count: AtomicU64::new(0),
-            active_expired_count: AtomicU64::new(0),
+            lazy_expired_count: CachePadded::new(AtomicU64::new(0)),
+            active_expired_count: CachePadded::new(AtomicU64::new(0)),
         }))
     }
 
@@ -246,35 +283,49 @@ impl StorageEngine {
 
     #[inline]
     pub fn tx_shared_guard(&self) -> EngineResult<std::sync::RwLockReadGuard<'_, ()>> {
-        self.tx_exec_fence
+        self.tx_shared_guard_striped(0)
+    }
+
+    #[inline]
+    pub fn tx_shared_guard_striped(
+        &self,
+        stripe_hint: usize,
+    ) -> EngineResult<std::sync::RwLockReadGuard<'_, ()>> {
+        self.tx_exec_fence[stripe_hint & (TX_FENCE_STRIPES - 1)]
             .read()
             .map_err(|_| EngineError::LockPoisoned("tx_exec_fence read"))
     }
 
     #[inline]
-    pub fn tx_exclusive_guard(&self) -> EngineResult<RwLockWriteGuard<'_, ()>> {
-        self.tx_exec_fence
-            .write()
-            .map_err(|_| EngineError::LockPoisoned("tx_exec_fence write"))
+    pub fn tx_exclusive_guard(&self) -> EngineResult<Vec<RwLockWriteGuard<'_, ()>>> {
+        let mut guards = Vec::with_capacity(TX_FENCE_STRIPES);
+        for stripe in &self.tx_exec_fence {
+            guards.push(
+                stripe
+                    .write()
+                    .map_err(|_| EngineError::LockPoisoned("tx_exec_fence write"))?,
+            );
+        }
+        Ok(guards)
     }
 
     /// Captures a key's current `(shard_idx, flush_epoch, key_version)` stamp for `WATCH`.
     pub fn watch_stamp(&self, key: &[u8]) -> EngineResult<WatchedKeyStamp> {
         let idx = self.shard_index(key);
         let now = Instant::now();
-        let expired = {
-            let guard = self.read_shard(idx)?;
-            guard.table.get(key).map(|r| r.is_expired(now)).unwrap_or(false)
-        };
-        if expired {
-            self.evict_if_expired(idx, key, now)?;
+        let mut guard = self.write_shard(idx)?;
+        if let Some(rec) = guard.table.get(key) {
+            if rec.is_expired(now) {
+                guard.remove_key(key);
+                self.lazy_expired_count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
         }
-        let guard = self.read_shard(idx)?;
+        let version = guard.register_watch(key);
         Ok(WatchedKeyStamp {
             key: key.to_vec().into_boxed_slice(),
             shard_idx: idx,
             flush_epoch: guard.flush_epoch(),
-            version: guard.key_version(key),
+            version,
         })
     }
 
@@ -418,7 +469,7 @@ impl StorageEngine {
 
     pub fn get_into(&self, key: &[u8], out: &mut Vec<u8>) -> EngineResult<()> {
         let idx = self.shard_index(key);
-        let now = Instant::now();
+        let mut expired_at = None;
         {
             let guard = self.read_shard(idx)?;
             match guard.table.get(key) {
@@ -426,22 +477,38 @@ impl StorageEngine {
                     write_null(out);
                     return Ok(());
                 }
-                Some(rec) if !rec.is_expired(now) => match &rec.value {
-                    DataValue::String(bytes) => {
-                        write_bulk_string(out, bytes);
-                        return Ok(());
+                Some(rec) => {
+                    let is_exp = if rec.expires_at.is_some() {
+                        let now = Instant::now();
+                        if rec.is_expired(now) {
+                            expired_at = Some(now);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !is_exp {
+                        match &rec.value {
+                            DataValue::String(bytes) => {
+                                write_bulk_string(out, bytes);
+                                return Ok(());
+                            }
+                            other => {
+                                return Err(EngineError::WrongType {
+                                    expected: "string",
+                                    actual: other.type_name(),
+                                });
+                            }
+                        }
                     }
-                    other => {
-                        return Err(EngineError::WrongType {
-                            expected: "string",
-                            actual: other.type_name(),
-                        });
-                    }
-                },
-                Some(_) => {}
+                }
             }
         }
-        self.evict_if_expired(idx, key, now)?;
+        if let Some(now) = expired_at {
+            self.evict_if_expired(idx, key, now)?;
+        }
         write_null(out);
         Ok(())
     }
@@ -454,27 +521,61 @@ impl StorageEngine {
         cond: SetCondition,
     ) -> EngineResult<bool> {
         let idx = self.shard_index(key);
-        let now = Instant::now();
         let mut guard = self.write_shard(idx)?;
+        let now = if ttl.is_some() || guard.expiring_keys > 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let expires_at = match (ttl, now) {
+            (Some(d), Some(n)) => Some(n + d),
+            _ => None,
+        };
 
-        if let Some(rec) = guard.table.get(key) {
-            if rec.is_expired(now) {
-                guard.remove_key(key);
+        let next_ver = guard.next_version;
+        if let Some(rec) = guard.table.get_mut(key) {
+            let is_exp = match (rec.expires_at, now) {
+                (Some(dl), Some(n)) => n >= dl,
+                _ => false,
+            };
+            if is_exp {
+                if matches!(cond, SetCondition::IfPresent) {
+                    guard.remove_key(key);
+                    self.lazy_expired_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(false);
+                }
                 self.lazy_expired_count.fetch_add(1, AtomicOrdering::Relaxed);
+            } else if matches!(cond, SetCondition::IfAbsent) {
+                return Ok(false);
             }
-        }
 
-        let exists = guard.table.contains_key(key);
-        match cond {
-            SetCondition::IfAbsent if exists => return Ok(false),
-            SetCondition::IfPresent if !exists => return Ok(false),
-            _ => {}
+            let prev_has_ttl = rec.expires_at.is_some();
+            let new_has_ttl = expires_at.is_some();
+            match &mut rec.value {
+                DataValue::String(existing) if existing.len() == val.len() => {
+                    existing.copy_from_slice(val);
+                }
+                slot => {
+                    *slot = DataValue::String(val.to_vec().into_boxed_slice());
+                }
+            }
+            rec.expires_at = expires_at;
+            rec.version = next_ver;
+            guard.next_version = next_ver.wrapping_add(1);
+            if prev_has_ttl && !new_has_ttl {
+                guard.expiring_keys = guard.expiring_keys.saturating_sub(1);
+            } else if !prev_has_ttl && new_has_ttl {
+                guard.expiring_keys += 1;
+            }
+            return Ok(true);
         }
-
-        let expires_at = ttl.map(|d| now + d);
+        if matches!(cond, SetCondition::IfPresent) {
+            return Ok(false);
+        }
         let record = Record {
             value: DataValue::String(val.to_vec().into_boxed_slice()),
             expires_at,
+            version: 0,
         };
         guard.upsert_record(key.to_vec().into_boxed_slice(), record);
         Ok(true)
@@ -497,7 +598,11 @@ impl StorageEngine {
         let mut guard = self.write_shard(idx)?;
         guard.upsert_record(
             key.to_vec().into_boxed_slice(),
-            Record { value, expires_at },
+            Record {
+                value,
+                expires_at,
+                version: 0,
+            },
         );
         Ok(())
     }
@@ -523,6 +628,7 @@ impl StorageEngine {
                     Record {
                         value: DataValue::String(formatted.into_boxed_slice()),
                         expires_at: None,
+                        version: 0,
                     },
                 );
                 Ok(delta)
@@ -569,6 +675,7 @@ impl StorageEngine {
                     Record {
                         value: DataValue::String(suffix.to_vec().into_boxed_slice()),
                         expires_at: None,
+                        version: 0,
                     },
                 );
                 Ok(len)
@@ -866,6 +973,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::List(list),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(len)
@@ -1067,6 +1175,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::Hash(map),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(newly_added)
@@ -1249,6 +1358,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::SortedSet(zset),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(added)
@@ -1676,6 +1786,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::Stream(stream),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(id)
@@ -1836,6 +1947,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::Stream(s),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(())
@@ -1976,6 +2088,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::HyperLogLog(hll),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(true)
@@ -2082,6 +2195,7 @@ impl StorageEngine {
             Record {
                 value: DataValue::HyperLogLog(acc),
                 expires_at: prev_exp,
+                version: 0,
             },
         );
         Ok(())
@@ -2121,6 +2235,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::BloomFilter(bf),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(true)
@@ -2189,6 +2304,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::CountMinSketch(cms),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(out)
@@ -2262,6 +2378,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::VectorIndex(hnsw),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(added)
@@ -2405,6 +2522,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::FullTextIndex(fts),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(added)
@@ -2526,6 +2644,7 @@ impl StorageEngine {
                 Record {
                     value: DataValue::TimeSeries(series),
                     expires_at: None,
+                    version: 0,
                 },
             );
             Ok(ts)

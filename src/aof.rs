@@ -121,6 +121,14 @@ impl AofEngine {
         self.log_raw_bytes(encoded)
     }
 
+    /// Enqueues a RESP mutation frame paired with an IEEE 802.3 CRC32 verification frame (`AOF.CRC32`).
+    pub fn log_command_with_crc32(&self, parts: &[&[u8]]) -> EngineResult<u32> {
+        let mut encoded = Vec::with_capacity(96);
+        let crc = encode_command_with_crc32(&mut encoded, parts);
+        self.log_raw_bytes(encoded)?;
+        Ok(crc)
+    }
+
     pub fn log_raw_bytes(&self, encoded: Vec<u8>) -> EngineResult<()> {
         if self.rewrite_in_progress.load(AtomicOrdering::Acquire) {
             let mut delta_guard = self
@@ -582,11 +590,43 @@ pub fn replay_aof(path: impl AsRef<Path>, storage: &StorageEngine) -> EngineResu
 pub struct CrashRecoveryReport {
     pub snapshot_keys_loaded: usize,
     pub aof_frames_replayed: usize,
+    pub crc32_verified_frames: usize,
     pub truncated_torn_bytes: usize,
     pub used_snapshot_fallback: bool,
 }
 
-/// Crash-recovery pipeline handling mid-frame AOF torn writes + CRC32 snapshot fallback.
+/// Encodes a RESP command followed by an inline `*2\r\n$9\r\nAOF.CRC32\r\n$8\r\n<hex>\r\n` IEEE 802.3 CRC32 frame.
+pub fn encode_command_with_crc32(out: &mut Vec<u8>, parts: &[&[u8]]) -> u32 {
+    let start = out.len();
+    encode_command_slices(out, parts);
+    let crc = !crc32_update(0xFFFF_FFFF, &out[start..]);
+    let hex_str = format!("{crc:08x}");
+    encode_command_slices(out, &[b"AOF.CRC32", hex_str.as_bytes()]);
+    crc
+}
+
+fn parse_aof_crc32_frame(frame: &RespFrame<'_>) -> EngineResult<Option<u32>> {
+    let RespFrame::Array(items) = frame else {
+        return Ok(None);
+    };
+    if items.len() == 2 {
+        if let (Some(cmd), Some(hex_bytes)) = (items[0].as_bytes(), items[1].as_bytes()) {
+            if cmd.eq_ignore_ascii_case(b"AOF.CRC32") {
+                let hex_str = std::str::from_utf8(hex_bytes).map_err(|_| {
+                    EngineError::CorruptedPersistence("invalid UTF-8 in AOF.CRC32 frame".to_string())
+                })?;
+                let crc = u32::from_str_radix(hex_str, 16).map_err(|_| {
+                    EngineError::CorruptedPersistence("invalid hex in AOF.CRC32 frame".to_string())
+                })?;
+                return Ok(Some(crc));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Crash-recovery pipeline handling mid-frame AOF torn writes, per-frame IEEE 802.3 CRC32 verification,
+/// and CRC32 snapshot fallback.
 pub fn recover_from_crash(
     aof_path: &Path,
     snapshot_path: &Path,
@@ -608,6 +648,7 @@ pub fn recover_from_crash(
         return Ok(CrashRecoveryReport {
             snapshot_keys_loaded: snapshot_keys,
             aof_frames_replayed: 0,
+            crc32_verified_frames: 0,
             truncated_torn_bytes: 0,
             used_snapshot_fallback: false,
         });
@@ -616,16 +657,51 @@ pub fn recover_from_crash(
     let raw = fs::read(aof_path)?;
     let mut offset = 0usize;
     let mut replayed = 0usize;
+    let mut crc32_verified = 0usize;
 
     while offset < raw.len() {
         match RespParser::parse(&raw[offset..]) {
             Ok(ParseStatus::Complete { frame, consumed }) => {
+                let frame_slice = &raw[offset..offset + consumed];
+                let computed_frame_crc = !crc32_update(0xFFFF_FFFF, frame_slice);
+
+                // Look ahead for an optional paired `AOF.CRC32` verification frame before mutating storage
+                let mut total_step = consumed;
+                let mut has_verified_crc = false;
+                let next_offset = offset + consumed;
+                if next_offset < raw.len() {
+                    if let Ok(ParseStatus::Complete {
+                        frame: next_frame,
+                        consumed: next_consumed,
+                    }) = RespParser::parse(&raw[next_offset..])
+                    {
+                        match parse_aof_crc32_frame(&next_frame) {
+                            Ok(Some(expected_crc)) => {
+                                if expected_crc != computed_frame_crc {
+                                    used_fallback = snapshot_keys > 0;
+                                    break;
+                                }
+                                has_verified_crc = true;
+                                total_step += next_consumed;
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                used_fallback = snapshot_keys > 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if apply_replayed_frame(&frame, storage).is_err() {
                     used_fallback = snapshot_keys > 0;
                     break;
                 }
-                offset += consumed;
+                offset += total_step;
                 replayed += 1;
+                if has_verified_crc {
+                    crc32_verified += 1;
+                }
             }
             Ok(ParseStatus::Incomplete) | Err(_) => {
                 used_fallback = snapshot_keys > 0;
@@ -644,6 +720,7 @@ pub fn recover_from_crash(
     Ok(CrashRecoveryReport {
         snapshot_keys_loaded: snapshot_keys,
         aof_frames_replayed: replayed,
+        crc32_verified_frames: crc32_verified,
         truncated_torn_bytes: torn_bytes,
         used_snapshot_fallback: used_fallback,
     })
@@ -667,6 +744,9 @@ pub fn apply_replayed_frame(frame: &RespFrame<'_>, storage: &StorageEngine) -> E
     }
 
     let cmd = args[0];
+    if cmd.eq_ignore_ascii_case(b"AOF.CRC32") {
+        return Ok(());
+    }
     if cmd.eq_ignore_ascii_case(b"SET") && args.len() >= 3 {
         storage.set(args[1], args[2], None, SetCondition::Always)?;
     } else if cmd.eq_ignore_ascii_case(b"DEL") && args.len() >= 2 {
