@@ -2849,43 +2849,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cache_padded_alignment_and_record_version_watch_tombstone() {
+    fn test_cache_padded_alignment_and_record_version_watch_tombstone() -> EngineResult<()> {
         assert_eq!(std::mem::align_of::<CachePadded<AtomicU64>>(), 64);
 
-        let engine = StorageEngine::new(4).unwrap();
-        engine
-            .set(b"k_watch", b"v1", None, SetCondition::Always)
-            .unwrap();
-        let stamp_before = engine.watch_stamp(b"k_watch").unwrap();
+        let engine = StorageEngine::new(4)?;
+        engine.set(b"k_watch", b"v1", None, SetCondition::Always)?;
+        let stamp_before = engine.watch_stamp(b"k_watch")?;
         assert_eq!(stamp_before.version, 1);
 
         // Overwrite in-place increments Record.version without needing key_versions entry.
-        engine
-            .set(b"k_watch", b"v2", None, SetCondition::Always)
-            .unwrap();
-        let stamp_after_set = engine.watch_stamp(b"k_watch").unwrap();
+        engine.set(b"k_watch", b"v2", None, SetCondition::Always)?;
+        let stamp_after_set = engine.watch_stamp(b"k_watch")?;
         assert_eq!(stamp_after_set.version, 2);
 
         // Deleting a watched key preserves bumped version in tombstone map so WATCH detects DEL.
-        let deleted = engine.del(&[b"k_watch".as_slice()]).unwrap();
+        let deleted = engine.del(&[b"k_watch".as_slice()])?;
         assert_eq!(deleted, 1);
-        let stamp_after_del = engine.watch_stamp(b"k_watch").unwrap();
+        let stamp_after_del = engine.watch_stamp(b"k_watch")?;
         assert!(stamp_after_del.version > stamp_after_set.version);
+        Ok(())
     }
 
     #[test]
-    fn test_multi_exec_rejects_synchronous_network_commands() {
+    fn test_multi_exec_rejects_synchronous_network_commands() -> EngineResult<()> {
         let mut cfg = ServerConfig::default();
         cfg.bind_addr = "127.0.0.1:0".to_string();
         cfg.aof_path = None;
         cfg.snapshot_path = std::env::temp_dir().join("ferrum_tx_rpc_test.snap");
-        let mut server = FerrumServer::start(cfg).unwrap();
+        let mut server = FerrumServer::start(cfg)?;
         let addr = server.local_addr();
 
-        let mut client = TcpStream::connect(addr).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        let mut client = TcpStream::connect(addr)?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
 
         let mut payload = Vec::new();
         encode_command_slices(&mut payload, &[b"MULTI"]);
@@ -2903,17 +2898,17 @@ mod tests {
             &[b"RAFT", b"APPENDENTRIES", b"1", b"node2", b"0", b"0", b"0"],
         );
         encode_command_slices(&mut payload, &[b"EXEC"]);
-        client.write_all(&payload).unwrap();
+        client.write_all(&payload)?;
 
         let mut rbuf = StreamReadBuffer::with_capacity(4096);
         let mut frames = Vec::new();
         while frames.len() < 6 {
             let dst = rbuf.writable_slice(1024);
-            let n = client.read(dst).unwrap();
+            let n = client.read(dst)?;
             assert!(n > 0);
             rbuf.advance_write(n);
             while let ParseStatus::Complete { frame, consumed } =
-                RespParser::parse(rbuf.readable_slice()).unwrap()
+                RespParser::parse(rbuf.readable_slice())?
             {
                 let is_exec = frames.len() == 5;
                 if is_exec {
@@ -2932,5 +2927,6 @@ mod tests {
         }
 
         server.shutdown();
+        Ok(())
     }
 }
