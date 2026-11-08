@@ -1,4 +1,6 @@
 /target/
+**/target/
+/ferrum_kv.exe
 *.exe
 *.pdb
 *.aof

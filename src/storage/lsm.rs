@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use crate::error::{EngineError, EngineResult};
+use crate::resp::{write_bulk_string, write_null};
 use crate::storage::probabilistic::BloomFilter;
 
 const SST_BLOCK_TARGET_BYTES: usize = 4096;
@@ -55,9 +56,11 @@ struct LsmState {
 }
 
 /// Hybrid Tiered Log-Structured Merge-Tree (`MemTable` + 4KB Block-Checksummed Disk `SSTable`s).
+/// Uses `RwLock<LsmState>` so concurrent readers (`get`, `get_into`, `scan`, `stats`) share read access
+/// to the `MemTable` and `SSTable` fence/Bloom indices without reader-reader contention.
 pub struct LsmEngine {
     dir: PathBuf,
-    inner: Mutex<LsmState>,
+    inner: RwLock<LsmState>,
 }
 
 impl LsmEngine {
@@ -89,7 +92,7 @@ impl LsmEngine {
 
         Ok(Self {
             dir: dir_buf,
-            inner: Mutex::new(LsmState {
+            inner: RwLock::new(LsmState {
                 memtable: BTreeMap::new(),
                 memtable_bytes: 0,
                 flush_threshold_bytes: flush_threshold_bytes.max(4096),
@@ -102,8 +105,8 @@ impl LsmEngine {
     pub fn put(&self, key: &[u8], val: &[u8]) -> EngineResult<()> {
         let mut guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .write()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock write"))?;
         let added = key.len() + val.len() + 16;
         guard.memtable.insert(
             key.to_vec().into_boxed_slice(),
@@ -119,8 +122,8 @@ impl LsmEngine {
     pub fn delete(&self, key: &[u8]) -> EngineResult<()> {
         let mut guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .write()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock write"))?;
         guard
             .memtable
             .insert(key.to_vec().into_boxed_slice(), LsmEntry::Tombstone);
@@ -134,8 +137,8 @@ impl LsmEngine {
     pub fn get(&self, key: &[u8]) -> EngineResult<Option<Box<[u8]>>> {
         let guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .read()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock read"))?;
 
         if let Some(entry) = guard.memtable.get(key) {
             return Ok(match entry {
@@ -158,6 +161,37 @@ impl LsmEngine {
         Ok(None)
     }
 
+    /// Zero-copy MemTable-to-socket serialization under shared `RwLockReadGuard`.
+    pub fn get_into(&self, key: &[u8], out: &mut Vec<u8>) -> EngineResult<()> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock read"))?;
+
+        if let Some(entry) = guard.memtable.get(key) {
+            match entry {
+                LsmEntry::Value(v) => write_bulk_string(out, v),
+                LsmEntry::Tombstone => write_null(out),
+            }
+            return Ok(());
+        }
+
+        for sst in guard.sstables.iter().rev() {
+            if !sst.bloom.exists(key) {
+                continue;
+            }
+            if let Some(entry) = search_sstable_on_disk(sst, key)? {
+                match entry {
+                    LsmEntry::Value(v) => write_bulk_string(out, &v),
+                    LsmEntry::Tombstone => write_null(out),
+                }
+                return Ok(());
+            }
+        }
+        write_null(out);
+        Ok(())
+    }
+
     pub fn scan(
         &self,
         start_key: &[u8],
@@ -166,8 +200,8 @@ impl LsmEngine {
     ) -> EngineResult<Vec<(Box<[u8]>, Box<[u8]>)>> {
         let guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .read()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock read"))?;
 
         let mut merged: BTreeMap<Box<[u8]>, LsmEntry> = BTreeMap::new();
         for sst in &guard.sstables {
@@ -199,8 +233,8 @@ impl LsmEngine {
     pub fn flush(&self) -> EngineResult<bool> {
         let mut guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .write()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock write"))?;
         self.flush_locked(&mut guard)
     }
 
@@ -225,8 +259,8 @@ impl LsmEngine {
     pub fn compact_all(&self) -> EngineResult<usize> {
         let mut guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .write()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock write"))?;
 
         if !guard.memtable.is_empty() {
             self.flush_locked(&mut guard)?;
@@ -267,8 +301,8 @@ impl LsmEngine {
     pub fn stats(&self) -> EngineResult<(usize, usize, usize)> {
         let guard = self
             .inner
-            .lock()
-            .map_err(|_| EngineError::LockPoisoned("LSM mutex"))?;
+            .read()
+            .map_err(|_| EngineError::LockPoisoned("LSM RwLock read"))?;
         let sst_entries: usize = guard.sstables.iter().map(|s| s.entry_count).sum();
         Ok((guard.memtable.len(), guard.sstables.len(), sst_entries))
     }
@@ -622,6 +656,84 @@ fn decode_verified_data_block(
     Ok(entries)
 }
 
+/// Zero-copy point lookup inside a CRC32-verified 4 KB SSTable block: borrows `&body[pos..pos+klen]`
+/// slices in-place and only allocates a `Box<[u8]>` if `target_key` matches.
+fn find_key_in_verified_block(
+    file: &mut File,
+    block_offset: u64,
+    block_len: u32,
+    target_key: &[u8],
+) -> EngineResult<Option<LsmEntry>> {
+    if block_len < 8 {
+        return Err(EngineError::CorruptedPersistence(
+            "corrupted SSTable data block length".to_string(),
+        ));
+    }
+    file.seek(SeekFrom::Start(block_offset))?;
+    let mut raw = vec![0u8; block_len as usize];
+    file.read_exact(&mut raw)?;
+
+    let body_end = raw.len() - 4;
+    let mut cpos = body_end;
+    let expected_crc = read_u32_le(&raw, &mut cpos)?;
+    if crc32_ieee(&raw[..body_end]) != expected_crc {
+        return Err(EngineError::CorruptedPersistence(
+            "SSTable 4KB data block CRC32 mismatch".to_string(),
+        ));
+    }
+
+    let body = &raw[..body_end];
+    let mut pos = 0usize;
+    let count = read_u32_le(body, &mut pos)? as usize;
+
+    for _ in 0..count {
+        let klen = read_u32_le(body, &mut pos)? as usize;
+        if pos + klen + 1 > body.len() {
+            return Err(EngineError::CorruptedPersistence(
+                "SSTable data block record truncated".to_string(),
+            ));
+        }
+        let key_slice = &body[pos..pos + klen];
+        pos += klen;
+        let tag = body[pos];
+        pos += 1;
+        let ord = key_slice.cmp(target_key);
+        match tag {
+            1 => {
+                let vlen = read_u32_le(body, &mut pos)? as usize;
+                if pos + vlen > body.len() {
+                    return Err(EngineError::CorruptedPersistence(
+                        "SSTable value truncated".to_string(),
+                    ));
+                }
+                if ord == std::cmp::Ordering::Equal {
+                    let val = body[pos..pos + vlen].to_vec().into_boxed_slice();
+                    return Ok(Some(LsmEntry::Value(val)));
+                }
+                if ord == std::cmp::Ordering::Greater {
+                    return Ok(None);
+                }
+                pos += vlen;
+            }
+            0 => {
+                if ord == std::cmp::Ordering::Equal {
+                    return Ok(Some(LsmEntry::Tombstone));
+                }
+                if ord == std::cmp::Ordering::Greater {
+                    return Ok(None);
+                }
+            }
+            other => {
+                return Err(EngineError::CorruptedPersistence(format!(
+                    "invalid SSTable entry tag {}",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn search_sstable_on_disk(sst: &SsTableMeta, key: &[u8]) -> EngineResult<Option<LsmEntry>> {
     if sst.fence_index.is_empty() {
         return Ok(None);
@@ -635,11 +747,7 @@ fn search_sstable_on_disk(sst: &SsTableMeta, key: &[u8]) -> EngineResult<Option<
     }
     let fp = &sst.fence_index[upper - 1];
     let mut file = File::open(&sst.path)?;
-    let block_entries = decode_verified_data_block(&mut file, fp.block_offset, fp.block_len)?;
-    if let Ok(idx) = block_entries.binary_search_by(|(k, _)| k.as_ref().cmp(key)) {
-        return Ok(Some(block_entries[idx].1.clone()));
-    }
-    Ok(None)
+    find_key_in_verified_block(&mut file, fp.block_offset, fp.block_len, key)
 }
 
 fn read_all_sstable_entries(sst: &SsTableMeta) -> EngineResult<Vec<(Box<[u8]>, LsmEntry)>> {

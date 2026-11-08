@@ -1,9 +1,38 @@
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{EngineError, EngineResult};
 use crate::resp::{write_array_header, write_bulk_string, write_integer};
+
+/// 64-byte cache-line aligned wrapper preventing false sharing across CPU cores.
+#[repr(align(64))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CachePadded<T>(pub T);
+
+impl<T> CachePadded<T> {
+    #[inline]
+    pub const fn new(val: T) -> Self {
+        Self(val)
+    }
+}
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SlowLogEntry {
@@ -72,13 +101,13 @@ impl RingEntries {
 
 /// Bounded ring-buffer `SlowLog` + operational metrics collector.
 pub struct TelemetryHub {
-    next_slowlog_id: AtomicU64,
-    slowlog_threshold_us: AtomicU64,
-    slowlog: Mutex<RingEntries>,
-    pub tx_committed_total: AtomicU64,
-    pub tx_aborted_total: AtomicU64,
-    pub auth_failures_total: AtomicU64,
-    pub scripts_executed_total: AtomicU64,
+    next_slowlog_id: CachePadded<AtomicU64>,
+    slowlog_threshold_us: CachePadded<AtomicU64>,
+    slowlog: CachePadded<Mutex<RingEntries>>,
+    pub tx_committed_total: CachePadded<AtomicU64>,
+    pub tx_aborted_total: CachePadded<AtomicU64>,
+    pub auth_failures_total: CachePadded<AtomicU64>,
+    pub scripts_executed_total: CachePadded<AtomicU64>,
 }
 
 impl Default for TelemetryHub {
@@ -90,13 +119,13 @@ impl Default for TelemetryHub {
 impl TelemetryHub {
     pub fn new(max_entries: usize, threshold_us: u64) -> Self {
         Self {
-            next_slowlog_id: AtomicU64::new(1),
-            slowlog_threshold_us: AtomicU64::new(threshold_us),
-            slowlog: Mutex::new(RingEntries::with_capacity(max_entries)),
-            tx_committed_total: AtomicU64::new(0),
-            tx_aborted_total: AtomicU64::new(0),
-            auth_failures_total: AtomicU64::new(0),
-            scripts_executed_total: AtomicU64::new(0),
+            next_slowlog_id: CachePadded::new(AtomicU64::new(1)),
+            slowlog_threshold_us: CachePadded::new(AtomicU64::new(threshold_us)),
+            slowlog: CachePadded::new(Mutex::new(RingEntries::with_capacity(max_entries))),
+            tx_committed_total: CachePadded::new(AtomicU64::new(0)),
+            tx_aborted_total: CachePadded::new(AtomicU64::new(0)),
+            auth_failures_total: CachePadded::new(AtomicU64::new(0)),
+            scripts_executed_total: CachePadded::new(AtomicU64::new(0)),
         }
     }
 

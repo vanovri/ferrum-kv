@@ -106,6 +106,57 @@ pub enum ParseStatus<'a> {
     Incomplete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatParseStatus {
+    Complete { consumed: usize },
+    Incomplete,
+    Fallback,
+}
+
+pub trait FlatArgSink<'a> {
+    fn clear_args(&mut self);
+    fn reserve_args(&mut self, count: usize);
+    fn push_arg(&mut self, buf: &'a [u8], start: usize, end: usize);
+}
+
+impl<'a> FlatArgSink<'a> for Vec<&'a [u8]> {
+    #[inline]
+    fn clear_args(&mut self) {
+        self.clear();
+    }
+
+    #[inline]
+    fn reserve_args(&mut self, count: usize) {
+        if self.capacity() < count {
+            self.reserve(count - self.len());
+        }
+    }
+
+    #[inline]
+    fn push_arg(&mut self, buf: &'a [u8], start: usize, end: usize) {
+        self.push(&buf[start..end]);
+    }
+}
+
+impl<'a> FlatArgSink<'a> for Vec<(usize, usize)> {
+    #[inline]
+    fn clear_args(&mut self) {
+        self.clear();
+    }
+
+    #[inline]
+    fn reserve_args(&mut self, count: usize) {
+        if self.capacity() < count {
+            self.reserve(count - self.len());
+        }
+    }
+
+    #[inline]
+    fn push_arg(&mut self, _buf: &'a [u8], start: usize, end: usize) {
+        self.push((start, end));
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LineKind {
     SimpleString,
@@ -148,6 +199,94 @@ enum MachineState<'a> {
 pub struct RespParser;
 
 impl RespParser {
+    /// Zero-allocation fast-path parser for flat 1D RESP Arrays of BulkStrings (`*N\r\n$L\r\n...\r\n`).
+    pub fn parse_flat_command<'a, S: FlatArgSink<'a>>(
+        buf: &'a [u8],
+        scratch_args: &mut S,
+    ) -> EngineResult<FlatParseStatus> {
+        scratch_args.clear_args();
+        if buf.is_empty() {
+            return Ok(FlatParseStatus::Incomplete);
+        }
+        if buf[0] != b'*' {
+            return Ok(FlatParseStatus::Fallback);
+        }
+
+        let Some(hdr_end) = find_crlf(buf, 1) else {
+            return Ok(FlatParseStatus::Incomplete);
+        };
+        let raw_count = parse_i64_bytes(&buf[1..hdr_end])?;
+        if raw_count <= 0 {
+            return Ok(FlatParseStatus::Fallback);
+        }
+        let count = raw_count as usize;
+        if count > MAX_COLLECTION_LEN {
+            return Err(EngineError::Protocol(
+                "array length exceeds protocol limit".to_string(),
+            ));
+        }
+
+        scratch_args.reserve_args(count.min(64));
+        let mut cursor = hdr_end + 2;
+
+        for _ in 0..count {
+            if cursor >= buf.len() {
+                scratch_args.clear_args();
+                return Ok(FlatParseStatus::Incomplete);
+            }
+            match buf[cursor] {
+                b'$' => {
+                    let Some(len_end) = find_crlf(buf, cursor + 1) else {
+                        scratch_args.clear_args();
+                        return Ok(FlatParseStatus::Incomplete);
+                    };
+                    let raw_len = parse_i64_bytes(&buf[cursor + 1..len_end])?;
+                    if raw_len < 0 {
+                        scratch_args.clear_args();
+                        return Ok(FlatParseStatus::Fallback);
+                    }
+                    let len = raw_len as usize;
+                    if len > MAX_BULK_LEN {
+                        scratch_args.clear_args();
+                        return Err(EngineError::Protocol(
+                            "bulk string exceeds maximum allowed frame size".to_string(),
+                        ));
+                    }
+                    let start = len_end + 2;
+                    let needed_end = start.saturating_add(len).saturating_add(2);
+                    if buf.len() < needed_end {
+                        scratch_args.clear_args();
+                        return Ok(FlatParseStatus::Incomplete);
+                    }
+                    if buf[start + len] != b'\r' || buf[start + len + 1] != b'\n' {
+                        scratch_args.clear_args();
+                        return Err(EngineError::Protocol(
+                            "bulk string missing trailing CRLF".to_string(),
+                        ));
+                    }
+                    scratch_args.push_arg(buf, start, start + len);
+                    cursor = needed_end;
+                }
+                b'+' => {
+                    let Some(line_end) = find_crlf(buf, cursor + 1) else {
+                        scratch_args.clear_args();
+                        return Ok(FlatParseStatus::Incomplete);
+                    };
+                    let start = cursor + 1;
+                    validate_no_bare_cr_lf(&buf[start..line_end])?;
+                    scratch_args.push_arg(buf, start, line_end);
+                    cursor = line_end + 2;
+                }
+                _ => {
+                    scratch_args.clear_args();
+                    return Ok(FlatParseStatus::Fallback);
+                }
+            }
+        }
+
+        Ok(FlatParseStatus::Complete { consumed: cursor })
+    }
+
     pub fn parse<'a>(buf: &'a [u8]) -> EngineResult<ParseStatus<'a>> {
         if buf.is_empty() {
             return Ok(ParseStatus::Incomplete);

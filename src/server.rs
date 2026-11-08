@@ -17,7 +17,7 @@ use crate::pubsub::{ClientOutbox, ClientSubscriptions, PubSubBroker};
 use crate::resp::{
     encode_command_slices, parse_f64_bytes, parse_i64_bytes, write_array_header, write_bulk_string,
     write_double, write_integer, write_map_header, write_null, write_simple_error,
-    write_simple_string, ParseStatus, RespFrame, RespParser, StreamReadBuffer,
+    write_simple_string, FlatParseStatus, ParseStatus, RespFrame, RespParser, StreamReadBuffer,
 };
 use crate::security::AclManager;
 use crate::storage::geospatial::GeoUnit;
@@ -26,7 +26,7 @@ use crate::storage::timeseries::TsAggregation;
 use crate::storage::vector_hnsw::VectorMetric;
 use crate::storage::{SetCondition, StorageEngine, TtlSweeper, DEFAULT_SHARD_COUNT};
 use crate::telemetry::{
-    render_info_all, render_prometheus_http_response, MetricsSnapshot, TelemetryHub,
+    render_info_all, render_prometheus_http_response, CachePadded, MetricsSnapshot, TelemetryHub,
 };
 use crate::tx::TransactionState;
 use crate::vm::{sha256, ScriptCache};
@@ -173,6 +173,7 @@ struct ActiveConnection {
     read_buf: StreamReadBuffer,
     write_buf: Vec<u8>,
     write_offset: usize,
+    scratch_args: Vec<(usize, usize)>,
     outbox: Arc<ClientOutbox>,
     subscriptions: ClientSubscriptions,
     authenticated_user: Option<String>,
@@ -193,11 +194,11 @@ struct ReactorShared {
     cluster: Arc<ClusterTopology>,
     raft: Arc<RaftNode>,
     pool: ConnectionBufferPool,
-    deques: Vec<Mutex<RingDeque<Box<ActiveConnection>>>>,
+    deques: Vec<CachePadded<Mutex<RingDeque<Box<ActiveConnection>>>>>,
     wakeup: Arc<(Mutex<u64>, Condvar)>,
-    shutdown: AtomicBool,
-    active_connections: AtomicUsize,
-    commands_processed: AtomicU64,
+    shutdown: CachePadded<AtomicBool>,
+    active_connections: CachePadded<AtomicUsize>,
+    commands_processed: CachePadded<AtomicU64>,
 }
 
 impl ReactorShared {
@@ -297,7 +298,7 @@ impl FerrumServer {
         let num_workers = config.worker_threads.max(1);
         let mut deques = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            deques.push(Mutex::new(RingDeque::with_capacity(64)));
+            deques.push(CachePadded::new(Mutex::new(RingDeque::with_capacity(64))));
         }
 
         let shared = Arc::new(ReactorShared {
@@ -313,9 +314,9 @@ impl FerrumServer {
             pool: ConnectionBufferPool::new(config.max_pooled_buffers),
             deques,
             wakeup,
-            shutdown: AtomicBool::new(false),
-            active_connections: AtomicUsize::new(0),
-            commands_processed: AtomicU64::new(0),
+            shutdown: CachePadded::new(AtomicBool::new(false)),
+            active_connections: CachePadded::new(AtomicUsize::new(0)),
+            commands_processed: CachePadded::new(AtomicU64::new(0)),
         });
 
         let mut worker_threads = Vec::with_capacity(num_workers);
@@ -423,6 +424,7 @@ fn acceptor_loop(listener: TcpListener, shared: Arc<ReactorShared>) {
                     read_buf,
                     write_buf,
                     write_offset: 0,
+                    scratch_args: Vec::with_capacity(16),
                     outbox: Arc::new(ClientOutbox::new()),
                     subscriptions: ClientSubscriptions::new(),
                     authenticated_user: initial_user,
@@ -633,6 +635,7 @@ fn drive_connection(conn: &mut ActiveConnection, shared: &ReactorShared) -> (boo
             id,
             ref mut read_buf,
             ref mut write_buf,
+            ref mut scratch_args,
             ref outbox,
             ref mut subscriptions,
             ref mut authenticated_user,
@@ -656,29 +659,87 @@ fn drive_connection(conn: &mut ActiveConnection, shared: &ReactorShared) -> (boo
         } else {
             let mut parsed_count = 0u64;
             loop {
-                let parse_res = RespParser::parse(read_buf.readable_slice());
-                let consumed = match parse_res {
-                    Ok(ParseStatus::Incomplete) => break,
-                    Ok(ParseStatus::Complete { frame, consumed }) => {
+                let consumed = match RespParser::parse_flat_command(
+                    read_buf.readable_slice(),
+                    scratch_args,
+                ) {
+                    Ok(FlatParseStatus::Incomplete) => break,
+                    Ok(FlatParseStatus::Complete { consumed }) => {
                         parsed_count += 1;
-                        if let Err(err) = execute_session_frame(
-                            id,
-                            &frame,
-                            shared,
-                            outbox,
-                            subscriptions,
-                            authenticated_user,
-                            tx,
-                            asking,
-                            closing,
-                            write_buf,
-                        ) {
+                        let frame_bytes = &read_buf.readable_slice()[..consumed];
+                        let exec_res = if scratch_args.len() <= 16 {
+                            let mut stack_args: [&[u8]; 16] = [&[]; 16];
+                            for (dst, &(s, e)) in
+                                stack_args.iter_mut().zip(scratch_args.iter())
+                            {
+                                *dst = &frame_bytes[s..e];
+                            }
+                            execute_session_args(
+                                id,
+                                &stack_args[..scratch_args.len()],
+                                shared,
+                                outbox,
+                                subscriptions,
+                                authenticated_user,
+                                tx,
+                                asking,
+                                closing,
+                                write_buf,
+                            )
+                        } else {
+                            let heap_args: Vec<&[u8]> = scratch_args
+                                .iter()
+                                .map(|&(s, e)| &frame_bytes[s..e])
+                                .collect();
+                            execute_session_args(
+                                id,
+                                &heap_args,
+                                shared,
+                                outbox,
+                                subscriptions,
+                                authenticated_user,
+                                tx,
+                                asking,
+                                closing,
+                                write_buf,
+                            )
+                        };
+                        if let Err(err) = exec_res {
                             tx.mark_abort();
                             let msg = err.to_resp_error_message();
                             write_simple_error(write_buf, msg.as_bytes());
                         }
                         consumed
                     }
+                    Ok(FlatParseStatus::Fallback) => match RespParser::parse(read_buf.readable_slice()) {
+                        Ok(ParseStatus::Incomplete) => break,
+                        Ok(ParseStatus::Complete { frame, consumed }) => {
+                            parsed_count += 1;
+                            if let Err(err) = execute_session_frame(
+                                id,
+                                &frame,
+                                shared,
+                                outbox,
+                                subscriptions,
+                                authenticated_user,
+                                tx,
+                                asking,
+                                closing,
+                                write_buf,
+                            ) {
+                                tx.mark_abort();
+                                let msg = err.to_resp_error_message();
+                                write_simple_error(write_buf, msg.as_bytes());
+                            }
+                            consumed
+                        }
+                        Err(proto_err) => {
+                            let msg = proto_err.to_resp_error_message();
+                            write_simple_error(write_buf, msg.as_bytes());
+                            *closing = true;
+                            break;
+                        }
+                    },
                     Err(proto_err) => {
                         let msg = proto_err.to_resp_error_message();
                         write_simple_error(write_buf, msg.as_bytes());
@@ -756,6 +817,41 @@ fn flush_nonblocking(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_session_args(
+    client_id: u64,
+    args: &[&[u8]],
+    shared: &ReactorShared,
+    outbox: &Arc<ClientOutbox>,
+    subscriptions: &mut ClientSubscriptions,
+    authenticated_user: &mut Option<String>,
+    tx: &mut TransactionState,
+    asking: &mut bool,
+    closing: &mut bool,
+    out: &mut Vec<u8>,
+) -> EngineResult<()> {
+    if args.is_empty() {
+        return Err(EngineError::InvalidArgument("empty command array".to_string()));
+    }
+
+    let started = Instant::now();
+    let res = dispatch_session_command(
+        client_id,
+        args,
+        shared,
+        outbox,
+        subscriptions,
+        authenticated_user,
+        tx,
+        asking,
+        closing,
+        out,
+    );
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    shared.telemetry.record_command(client_id, elapsed_us, args);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_session_frame(
     client_id: u64,
     frame: &RespFrame<'_>,
@@ -785,8 +881,7 @@ fn execute_session_frame(
         args.push(slice);
     }
 
-    let started = Instant::now();
-    let res = dispatch_session_command(
+    execute_session_args(
         client_id,
         &args,
         shared,
@@ -797,10 +892,7 @@ fn execute_session_frame(
         asking,
         closing,
         out,
-    );
-    let elapsed_us = started.elapsed().as_micros() as u64;
-    shared.telemetry.record_command(client_id, elapsed_us, &args);
-    res
+    )
 }
 
 fn extract_primary_key<'a>(args: &[&'a [u8]]) -> Option<&'a [u8]> {
@@ -832,6 +924,7 @@ fn extract_primary_key<'a>(args: &[&'a [u8]]) -> Option<&'a [u8]> {
         || cmd.eq_ignore_ascii_case(b"UNWATCH")
         || cmd.eq_ignore_ascii_case(b"ASKING")
         || cmd.eq_ignore_ascii_case(b"CLUSTER")
+        || cmd.eq_ignore_ascii_case(b"RAFT")
         || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
         || cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE")
         || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
@@ -1284,6 +1377,11 @@ fn execute_core_command(
             write_simple_string(out, b"OK");
             return Ok(());
         } else if sub.eq_ignore_ascii_case(b"MIGRATE") {
+            if inside_exclusive_tx {
+                return Err(EngineError::InvalidArgument(
+                    "CLUSTER MIGRATE is not allowed inside MULTI/EXEC".to_string(),
+                ));
+            }
             require_exact_args("cluster migrate", args, 4)?;
             let target = std::str::from_utf8(args[2])?;
             let moved = shared.cluster.migrate_key(target, args[3], &shared.storage)?;
@@ -1296,7 +1394,92 @@ fn execute_core_command(
         }
     }
 
-    if cmd.eq_ignore_ascii_case(b"RAFT.VOTE") {
+    if cmd.eq_ignore_ascii_case(b"RAFT") {
+        require_min_args("raft", args, 2)?;
+        let sub = args[1];
+        if sub.eq_ignore_ascii_case(b"PROPOSE")
+            || sub.eq_ignore_ascii_case(b"REQUESTVOTE")
+            || sub.eq_ignore_ascii_case(b"VOTE")
+            || sub.eq_ignore_ascii_case(b"APPENDENTRIES")
+            || sub.eq_ignore_ascii_case(b"APPEND")
+            || sub.eq_ignore_ascii_case(b"ELECT")
+        {
+            if inside_exclusive_tx {
+                return Err(EngineError::InvalidArgument(
+                    "synchronous RAFT command is not allowed inside MULTI/EXEC".to_string(),
+                ));
+            }
+        }
+        if sub.eq_ignore_ascii_case(b"PROPOSE") {
+            require_min_args("raft propose", args, 3)?;
+            shared.raft.propose_command(&args[2..], out)?;
+            return Ok(());
+        } else if sub.eq_ignore_ascii_case(b"REQUESTVOTE") || sub.eq_ignore_ascii_case(b"VOTE") {
+            require_exact_args("raft requestvote", args, 6)?;
+            let term = parse_i64_bytes(args[2])?.max(0) as u64;
+            let candidate_id = std::str::from_utf8(args[3])?;
+            let last_idx = parse_i64_bytes(args[4])?.max(0) as u64;
+            let last_term = parse_i64_bytes(args[5])?.max(0) as u64;
+            let (cur_term, granted) =
+                shared
+                    .raft
+                    .handle_request_vote(term, candidate_id, last_idx, last_term)?;
+            write_array_header(out, 2);
+            write_integer(out, cur_term as i64);
+            write_integer(out, i64::from(granted));
+            return Ok(());
+        } else if sub.eq_ignore_ascii_case(b"APPENDENTRIES") || sub.eq_ignore_ascii_case(b"APPEND") {
+            require_min_args("raft appendentries", args, 7)?;
+            if (args.len() - 7) % 3 != 0 {
+                return Err(EngineError::InvalidArgument(
+                    "malformed RAFT APPENDENTRIES entry triples".to_string(),
+                ));
+            }
+            let term = parse_i64_bytes(args[2])?.max(0) as u64;
+            let leader_id = std::str::from_utf8(args[3])?;
+            let prev_idx = parse_i64_bytes(args[4])?.max(0) as u64;
+            let prev_term = parse_i64_bytes(args[5])?.max(0) as u64;
+            let leader_commit = parse_i64_bytes(args[6])?.max(0) as u64;
+
+            let mut entries = Vec::with_capacity((args.len() - 7) / 3);
+            let mut i = 7usize;
+            while i + 2 < args.len() {
+                let e_idx = parse_i64_bytes(args[i])?.max(1) as u64;
+                let e_term = parse_i64_bytes(args[i + 1])?.max(0) as u64;
+                let e_wire = args[i + 2];
+                entries.push(RaftLogEntry::decode_command_wire(e_idx, e_term, e_wire)?);
+                i += 3;
+            }
+            let (cur_term, ok, my_last) = shared.raft.handle_append_entries(
+                term,
+                leader_id,
+                prev_idx,
+                prev_term,
+                entries,
+                leader_commit,
+            )?;
+            write_array_header(out, 3);
+            write_integer(out, cur_term as i64);
+            write_integer(out, i64::from(ok));
+            write_integer(out, my_last as i64);
+            return Ok(());
+        } else if sub.eq_ignore_ascii_case(b"ELECT") {
+            let won = shared.raft.start_election()?;
+            write_integer(out, i64::from(won));
+            return Ok(());
+        } else {
+            return Err(EngineError::InvalidArgument(
+                "unknown RAFT subcommand".to_string(),
+            ));
+        }
+    }
+
+    if cmd.eq_ignore_ascii_case(b"RAFT.VOTE") || cmd.eq_ignore_ascii_case(b"RAFT.REQUESTVOTE") {
+        if inside_exclusive_tx {
+            return Err(EngineError::InvalidArgument(
+                "RAFT.VOTE is not allowed inside MULTI/EXEC".to_string(),
+            ));
+        }
         require_exact_args("raft.vote", args, 5)?;
         let term = parse_i64_bytes(args[1])?.max(0) as u64;
         let candidate_id = std::str::from_utf8(args[2])?;
@@ -1312,7 +1495,12 @@ fn execute_core_command(
         return Ok(());
     }
 
-    if cmd.eq_ignore_ascii_case(b"RAFT.APPEND") {
+    if cmd.eq_ignore_ascii_case(b"RAFT.APPEND") || cmd.eq_ignore_ascii_case(b"RAFT.APPENDENTRIES") {
+        if inside_exclusive_tx {
+            return Err(EngineError::InvalidArgument(
+                "RAFT.APPEND is not allowed inside MULTI/EXEC".to_string(),
+            ));
+        }
         require_min_args("raft.append", args, 6)?;
         if (args.len() - 6) % 3 != 0 {
             return Err(EngineError::InvalidArgument(
@@ -1373,12 +1561,22 @@ fn execute_core_command(
     }
 
     if cmd.eq_ignore_ascii_case(b"RAFT.ELECT") {
+        if inside_exclusive_tx {
+            return Err(EngineError::InvalidArgument(
+                "RAFT.ELECT is not allowed inside MULTI/EXEC".to_string(),
+            ));
+        }
         let won = shared.raft.start_election()?;
         write_integer(out, i64::from(won));
         return Ok(());
     }
 
     if cmd.eq_ignore_ascii_case(b"RAFT.PROPOSE") {
+        if inside_exclusive_tx {
+            return Err(EngineError::InvalidArgument(
+                "RAFT.PROPOSE is not allowed inside MULTI/EXEC".to_string(),
+            ));
+        }
         require_min_args("raft.propose", args, 2)?;
         shared.raft.propose_command(&args[1..], out)?;
         return Ok(());
@@ -1437,10 +1635,7 @@ fn execute_core_command(
     }
     if cmd.eq_ignore_ascii_case(b"LSM.GET") {
         require_exact_args("lsm.get", args, 2)?;
-        match shared.storage.lsm_engine()?.get(args[1])? {
-            Some(v) => write_bulk_string(out, &v),
-            None => write_null(out),
-        }
+        shared.storage.lsm_engine()?.get_into(args[1], out)?;
         return Ok(());
     }
     if cmd.eq_ignore_ascii_case(b"LSM.SCAN") {
@@ -2631,5 +2826,96 @@ fn require_min_args(name: &str, args: &[&[u8]], min_len: usize) -> EngineResult<
         )))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_padded_alignment_and_record_version_watch_tombstone() {
+        assert_eq!(std::mem::align_of::<CachePadded<AtomicU64>>(), 64);
+
+        let engine = StorageEngine::new(4).unwrap();
+        engine
+            .set(b"k_watch", b"v1", None, SetCondition::Always)
+            .unwrap();
+        let stamp_before = engine.watch_stamp(b"k_watch").unwrap();
+        assert_eq!(stamp_before.version, 1);
+
+        // Overwrite in-place increments Record.version without needing key_versions entry.
+        engine
+            .set(b"k_watch", b"v2", None, SetCondition::Always)
+            .unwrap();
+        let stamp_after_set = engine.watch_stamp(b"k_watch").unwrap();
+        assert_eq!(stamp_after_set.version, 2);
+
+        // Deleting a watched key preserves bumped version in tombstone map so WATCH detects DEL.
+        let deleted = engine.del(&[b"k_watch".as_slice()]).unwrap();
+        assert_eq!(deleted, 1);
+        let stamp_after_del = engine.watch_stamp(b"k_watch").unwrap();
+        assert!(stamp_after_del.version > stamp_after_set.version);
+    }
+
+    #[test]
+    fn test_multi_exec_rejects_synchronous_network_commands() {
+        let mut cfg = ServerConfig::default();
+        cfg.bind_addr = "127.0.0.1:0".to_string();
+        cfg.aof_path = None;
+        cfg.snapshot_path = std::env::temp_dir().join("ferrum_tx_rpc_test.snap");
+        let mut server = FerrumServer::start(cfg).unwrap();
+        let addr = server.local_addr();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let mut payload = Vec::new();
+        encode_command_slices(&mut payload, &[b"MULTI"]);
+        encode_command_slices(
+            &mut payload,
+            &[b"CLUSTER", b"MIGRATE", &addr.to_string().into_bytes(), b"k1"],
+        );
+        encode_command_slices(&mut payload, &[b"RAFT", b"PROPOSE", b"SET", b"k1", b"v1"]);
+        encode_command_slices(
+            &mut payload,
+            &[b"RAFT", b"REQUESTVOTE", b"1", b"node2", b"0", b"0"],
+        );
+        encode_command_slices(
+            &mut payload,
+            &[b"RAFT", b"APPENDENTRIES", b"1", b"node2", b"0", b"0", b"0"],
+        );
+        encode_command_slices(&mut payload, &[b"EXEC"]);
+        client.write_all(&payload).unwrap();
+
+        let mut rbuf = StreamReadBuffer::with_capacity(4096);
+        let mut frames = Vec::new();
+        while frames.len() < 6 {
+            let dst = rbuf.writable_slice(1024);
+            let n = client.read(dst).unwrap();
+            assert!(n > 0);
+            rbuf.advance_write(n);
+            while let ParseStatus::Complete { frame, consumed } =
+                RespParser::parse(rbuf.readable_slice()).unwrap()
+            {
+                let is_exec = frames.len() == 5;
+                if is_exec {
+                    if let RespFrame::Array(items) = frame {
+                        assert_eq!(items.len(), 4);
+                        for item in items {
+                            assert!(matches!(item, RespFrame::SimpleError(_)));
+                        }
+                    } else {
+                        panic!("expected EXEC array reply");
+                    }
+                }
+                frames.push(consumed);
+                rbuf.consume(consumed);
+            }
+        }
+
+        server.shutdown();
     }
 }

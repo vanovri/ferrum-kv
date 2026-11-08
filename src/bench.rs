@@ -375,6 +375,8 @@ fn client_worker(
                 match RespParser::parse(read_buf.readable_slice())? {
                     ParseStatus::Complete { consumed, .. } => {
                         read_buf.consume(consumed);
+                        let op_ns = (t0.elapsed().as_nanos() as u64).max(1);
+                        latencies_ns.push(op_ns);
                         replies += 1;
                         if replies == batch {
                             break;
@@ -397,12 +399,6 @@ fn client_worker(
                     Err(err) => return Err(EngineError::Io(err)),
                 }
             }
-        }
-
-        let batch_ns = t0.elapsed().as_nanos() as u64;
-        let per_op_ns = (batch_ns / (batch as u64)).max(1);
-        for _ in 0..batch {
-            latencies_ns.push(per_op_ns);
         }
 
         completed += batch;
